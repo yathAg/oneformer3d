@@ -62,11 +62,17 @@ def rename_gt(gt_semantic_masks, gt_instance_masks, valid_class_ids):
         assert len(unique) < 1000
         for i in unique:
             semantic_instance = semantic_mask[instance_mask == i]
-            semantic_unique = np.unique(semantic_instance)
-            assert len(semantic_unique) == 1
-            if semantic_unique[0] in valid_class_ids:
-                instance_mask[instance_mask ==
-                              i] = 1000 * semantic_unique[0] + i
+            if semantic_instance.size == 0:
+                continue
+            sem_ids, sem_counts = np.unique(semantic_instance, return_counts=True)
+            # Ignore semantic id 0; then pick the majority semantic id.
+            nonzero = sem_ids != 0
+            if np.any(nonzero):
+                sem_ids = sem_ids[nonzero]
+                sem_counts = sem_counts[nonzero]
+            majority_sem = sem_ids[np.argmax(sem_counts)]
+            if majority_sem in valid_class_ids:
+                instance_mask[instance_mask == i] = 1000 * majority_sem + i
         renamed_instance_masks.append(instance_mask)
     return renamed_instance_masks
 

@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import spconv.pytorch as spconv
 from torch_scatter import scatter_mean
 import MinkowskiEngine as ME
+import torch.cuda.nvtx as nvtx
 
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import PointData
@@ -28,10 +29,13 @@ class ScanNetOneFormer3DMixin:
             List[PointData]: of len 1 with `pts_semantic_mask`,
                 `pts_instance_mask`, `instance_labels`, `instance_scores`.
         """
-        inst_res = self.predict_by_feat_instance(
-            out, superpoints, self.test_cfg.inst_score_thr)
-        sem_res = self.predict_by_feat_semantic(out, superpoints)
-        pan_res = self.predict_by_feat_panoptic(out, superpoints)
+        with nvtx.range("post_instance"):
+            inst_res = self.predict_by_feat_instance(
+                out, superpoints, self.test_cfg.inst_score_thr)
+        with nvtx.range("post_semantic"):
+            sem_res = self.predict_by_feat_semantic(out, superpoints)
+        with nvtx.range("post_panoptic"):
+            pan_res = self.predict_by_feat_panoptic(out, superpoints)
 
         pts_semantic_mask = [sem_res.cpu().numpy(), pan_res[0].cpu().numpy()]
         pts_instance_mask = [inst_res[0].cpu().bool().numpy(),
@@ -64,47 +68,52 @@ class ScanNetOneFormer3DMixin:
         cls_preds = out['cls_preds'][0]
         pred_masks = out['masks'][0]
 
-        scores = F.softmax(cls_preds, dim=-1)[:, :-1]
-        if out['scores'][0] is not None:
-            scores *= out['scores'][0]
-        labels = torch.arange(
-            self.num_classes,
-            device=scores.device).unsqueeze(0).repeat(
-                len(cls_preds), 1).flatten(0, 1)
-        scores, topk_idx = scores.flatten(0, 1).topk(
-            self.test_cfg.topk_insts, sorted=False)
-        labels = labels[topk_idx]
+        with nvtx.range("inst_scores_softmax"):
+            scores = F.softmax(cls_preds, dim=-1)[:, :-1]
+            if out['scores'][0] is not None:
+                scores *= out['scores'][0]
+        with nvtx.range("inst_labels_topk"):
+            labels = torch.arange(
+                self.num_classes,
+                device=scores.device).unsqueeze(0).repeat(
+                    len(cls_preds), 1).flatten(0, 1)
+            scores, topk_idx = scores.flatten(0, 1).topk(
+                self.test_cfg.topk_insts, sorted=False)
+            labels = labels[topk_idx]
 
-        topk_idx = torch.div(topk_idx, self.num_classes, rounding_mode='floor')
-        mask_pred = pred_masks
-        mask_pred = mask_pred[topk_idx]
-        mask_pred_sigmoid = mask_pred.sigmoid()
+            topk_idx = torch.div(topk_idx, self.num_classes, rounding_mode='floor')
+            mask_pred = pred_masks
+            mask_pred = mask_pred[topk_idx]
+            mask_pred_sigmoid = mask_pred.sigmoid()
 
         if self.test_cfg.get('obj_normalization', None):
-            mask_scores = (mask_pred_sigmoid * (mask_pred > 0)).sum(1) / \
-                ((mask_pred > 0).sum(1) + 1e-6)
-            scores = scores * mask_scores
+            with nvtx.range("inst_obj_normalization"):
+                mask_scores = (mask_pred_sigmoid * (mask_pred > 0)).sum(1) / \
+                    ((mask_pred > 0).sum(1) + 1e-6)
+                scores = scores * mask_scores
 
         if self.test_cfg.get('nms', None):
-            kernel = self.test_cfg.matrix_nms_kernel
-            scores, labels, mask_pred_sigmoid, _ = mask_matrix_nms(
-                mask_pred_sigmoid, labels, scores, kernel=kernel)
+            with nvtx.range("inst_matrix_nms"):
+                kernel = self.test_cfg.matrix_nms_kernel
+                scores, labels, mask_pred_sigmoid, _ = mask_matrix_nms(
+                    mask_pred_sigmoid, labels, scores, kernel=kernel)
 
-        mask_pred_sigmoid = mask_pred_sigmoid[:, superpoints]
-        mask_pred = mask_pred_sigmoid > self.test_cfg.sp_score_thr
+        with nvtx.range("inst_superpoint_mask"):
+            mask_pred_sigmoid = mask_pred_sigmoid[:, superpoints]
+            mask_pred = mask_pred_sigmoid > self.test_cfg.sp_score_thr
 
-        # score_thr
-        score_mask = scores > score_threshold
-        scores = scores[score_mask]
-        labels = labels[score_mask]
-        mask_pred = mask_pred[score_mask]
+        with nvtx.range("inst_score_filter"):
+            score_mask = scores > score_threshold
+            scores = scores[score_mask]
+            labels = labels[score_mask]
+            mask_pred = mask_pred[score_mask]
 
-        # npoint_thr
-        mask_pointnum = mask_pred.sum(1)
-        npoint_mask = mask_pointnum > self.test_cfg.npoint_thr
-        scores = scores[npoint_mask]
-        labels = labels[npoint_mask]
-        mask_pred = mask_pred[npoint_mask]
+        with nvtx.range("inst_npoint_filter"):
+            mask_pointnum = mask_pred.sum(1)
+            npoint_mask = mask_pointnum > self.test_cfg.npoint_thr
+            scores = scores[npoint_mask]
+            labels = labels[npoint_mask]
+            mask_pred = mask_pred[npoint_mask]
 
         return mask_pred, labels, scores
 
@@ -123,7 +132,8 @@ class ScanNetOneFormer3DMixin:
         """
         if classes is None:
             classes = list(range(out['sem_preds'][0].shape[1] - 1))
-        return out['sem_preds'][0][:, classes].argmax(dim=1)[superpoints]
+        with nvtx.range("semantic_argmax"):
+            return out['sem_preds'][0][:, classes].argmax(dim=1)[superpoints]
 
     def predict_by_feat_panoptic(self, out, superpoints):
         """Predict panoptic masks for a single scene.
@@ -141,37 +151,40 @@ class ScanNetOneFormer3DMixin:
                 Tensor: semantic mask of shape (n_raw_points,),
                 Tensor: instance mask of shape (n_raw_points,).
         """
-        sem_map = self.predict_by_feat_semantic(
-            out, superpoints, self.test_cfg.stuff_classes)
-        mask_pred, labels, scores  = self.predict_by_feat_instance(
-            out, superpoints, self.test_cfg.pan_score_thr)
+        with nvtx.range("panoptic_semantic"):
+            sem_map = self.predict_by_feat_semantic(
+                out, superpoints, self.test_cfg.stuff_classes)
+        with nvtx.range("panoptic_instance_branch"):
+            mask_pred, labels, scores  = self.predict_by_feat_instance(
+                out, superpoints, self.test_cfg.pan_score_thr)
         if mask_pred.shape[0] == 0:
             return sem_map, sem_map
+        with nvtx.range("panoptic_sort"):
+            scores, idxs = scores.sort()
+            labels = labels[idxs]
+            mask_pred = mask_pred[idxs]
 
-        scores, idxs = scores.sort()
-        labels = labels[idxs]
-        mask_pred = mask_pred[idxs]
+        with nvtx.range("panoptic_merge"):
+            n_stuff_classes = len(self.test_cfg.stuff_classes)
+            inst_idxs = torch.arange(
+                n_stuff_classes, 
+                mask_pred.shape[0] + n_stuff_classes, 
+                device=mask_pred.device).view(-1, 1)
+            insts = inst_idxs * mask_pred
+            things_inst_mask, idxs = insts.max(axis=0)
+            things_sem_mask = labels[idxs] + n_stuff_classes
 
-        n_stuff_classes = len(self.test_cfg.stuff_classes)
-        inst_idxs = torch.arange(
-            n_stuff_classes, 
-            mask_pred.shape[0] + n_stuff_classes, 
-            device=mask_pred.device).view(-1, 1)
-        insts = inst_idxs * mask_pred
-        things_inst_mask, idxs = insts.max(axis=0)
-        things_sem_mask = labels[idxs] + n_stuff_classes
+            inst_idxs, num_pts = things_inst_mask.unique(return_counts=True)
+            for inst, pts in zip(inst_idxs, num_pts):
+                if pts <= self.test_cfg.npoint_thr and inst != 0:
+                    things_inst_mask[things_inst_mask == inst] = 0
 
-        inst_idxs, num_pts = things_inst_mask.unique(return_counts=True)
-        for inst, pts in zip(inst_idxs, num_pts):
-            if pts <= self.test_cfg.npoint_thr and inst != 0:
-                things_inst_mask[things_inst_mask == inst] = 0
-
-        things_sem_mask[things_inst_mask == 0] = 0
-      
-        sem_map[things_inst_mask != 0] = 0
-        inst_map = sem_map.clone()
-        inst_map += things_inst_mask
-        sem_map += things_sem_mask
+            things_sem_mask[things_inst_mask == 0] = 0
+          
+            sem_map[things_inst_mask != 0] = 0
+            inst_map = sem_map.clone()
+            inst_map += things_inst_mask
+            sem_map += things_sem_mask
         return sem_map, inst_map
     
     def _select_queries(self, x, gt_instances):
@@ -195,13 +208,18 @@ class ScanNetOneFormer3DMixin:
         for i in range(len(x)):
             if self.query_thr < 1:
                 n = (1 - self.query_thr) * torch.rand(1) + self.query_thr
-                n = (n * len(x[i])).int()
-                ids = torch.randperm(len(x[i]))[:n].to(x[i].device)
-                queries.append(x[i][ids])
-                gt_instances[i].query_masks = gt_instances[i].sp_masks[:, ids]
+                n = int((n * len(x[i])).item())
             else:
+                n = len(x[i])
+            query_mult = getattr(self, 'query_mult', 1.0)
+            if self.query_thr >= 1 and query_mult == 1.0:
                 queries.append(x[i])
                 gt_instances[i].query_masks = gt_instances[i].sp_masks
+                continue
+            n = max(int(query_mult * n), 1)
+            ids = torch.randperm(len(x[i]))[:n].to(x[i].device)
+            queries.append(x[i][ids])
+            gt_instances[i].query_masks = gt_instances[i].sp_masks[:, ids]
         return queries, gt_instances
 
 
@@ -238,6 +256,8 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                  num_classes,
                  min_spatial_shape,
                  query_thr,
+                 query_mult=1.0,
+                 learned_queries_only=False,
                  backbone=None,
                  decoder=None,
                  criterion=None,
@@ -254,9 +274,27 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         self.num_classes = num_classes
         self.min_spatial_shape = min_spatial_shape
         self.query_thr = query_thr
+        self.query_mult = query_mult
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         self._init_layers(in_channels, num_channels)
+        # Inference-only: lazily convert heavy modules to FP16 so spconv uses
+        # real FP16 kernels (autocast alone won't switch spconv).
+        self._full_fp16_infer_initialized = False
+
+    def _maybe_init_full_fp16_infer(self) -> None:
+        """Optionally convert heavy modules to FP16 once for inference.
+
+        Enable by setting ``test_cfg.fp16_infer = True``. Defaults to FP32.
+        """
+        if not (getattr(self, 'test_cfg', None)
+                and self.test_cfg.get('fp16_infer', False)):
+            return
+        if self._full_fp16_infer_initialized:
+            return
+        for module in (self.input_conv, self.unet, self.output_layer, self.decoder):
+            module.half()
+        self._full_fp16_infer_initialized = True
     
     def _init_layers(self, in_channels, num_channels):
         self.input_conv = spconv.SparseSequential(
@@ -285,10 +323,14 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             List[Tensor]: of len batch_size,
                 each of shape (n_points_i, n_channels).
         """
-        x = self.input_conv(x)
-        x, _ = self.unet(x)
-        x = self.output_layer(x)
-        x = scatter_mean(x.features[inverse_mapping], superpoints, dim=0)
+        with nvtx.range("input_conv"):
+            x = self.input_conv(x)
+        with nvtx.range("unet"):
+            x, _ = self.unet(x)
+        with nvtx.range("output_proj"):
+            x = self.output_layer(x)
+        with nvtx.range("scatter_mean_split"):
+            x = scatter_mean(x.features[inverse_mapping], superpoints, dim=0)
         out = []
         for i in range(len(batch_offsets) - 1):
             out.append(x[batch_offsets[i]: batch_offsets[i + 1]])
@@ -317,7 +359,10 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 [((el_p - el_p.min(0)[0]),
                   torch.hstack((p[:, 3:], p[:, :3] - p[:, :3].mean(0))))
                  for el_p, p in zip(elastic_points, points)])
-        
+        # MinkowskiEngine's TensorField.sparse averaging op only supports
+        # float32/float64; keep this step in float32, then we can downcast
+        # features to FP16 after the sparse tensor is built.
+        features = features.float()
         spatial_shape = torch.clip(
             coordinates.max(0)[0][1:] + 1, self.min_spatial_shape)
         field = ME.TensorField(features=features, coordinates=coordinates)
@@ -393,30 +438,158 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 - pts_instance_mask (Tensor): Instance mask, has a shape
                     (num_points, num_instances) of type bool.
         """
-        batch_offsets = [0]
-        superpoint_bias = 0
-        sp_pts_masks = []
-        for i in range(len(batch_data_samples)):
-            gt_pts_seg = batch_data_samples[i].gt_pts_seg
-            gt_pts_seg.sp_pts_mask += superpoint_bias
-            superpoint_bias = gt_pts_seg.sp_pts_mask.max().item() + 1
-            batch_offsets.append(superpoint_bias)
-            sp_pts_masks.append(gt_pts_seg.sp_pts_mask)
-
-        coordinates, features, inverse_mapping, spatial_shape = self.collate(
-            batch_inputs_dict['points'])
-
-        x = spconv.SparseConvTensor(
-            features, coordinates, spatial_shape, len(batch_data_samples))
-        sp_pts_masks = torch.hstack(sp_pts_masks)
-        x = self.extract_feat(
-            x, sp_pts_masks, inverse_mapping, batch_offsets)
-        x = self.decoder(x, x)
-
-        results_list = self.predict_by_feat(x, sp_pts_masks)
-        for i, data_sample in enumerate(batch_data_samples):
-            data_sample.pred_pts_seg = results_list[i]
+        assert len(batch_data_samples) == 1
+        superpoints = batch_data_samples[0].gt_pts_seg.sp_pts_mask
+        batch_offsets = [0, int(superpoints.max().item()) + 1]
+        full_fp16 = bool(getattr(self.test_cfg, 'full_fp16', False)
+                         or self.test_cfg.get('full_fp16', False))
+        autocast_enabled = full_fp16 and torch.cuda.is_available()
+        if autocast_enabled and (not self.training):
+            self._maybe_init_full_fp16_infer()
+        with nvtx.range("inference_pass"):
+            with torch.autocast('cuda', dtype=torch.float16, enabled=autocast_enabled):
+                with nvtx.range("extract_feat"):
+                    with nvtx.range("collate_voxelize"):
+                        points = batch_inputs_dict['points']
+                        if autocast_enabled:
+                            points = [p.half() for p in points]
+                        coordinates, features, inverse_mapping, spatial_shape = self.collate(
+                            points)
+                        if autocast_enabled:
+                            features = features.half()
+                        x = spconv.SparseConvTensor(
+                            features, coordinates, spatial_shape, len(batch_data_samples))
+                    x = self.extract_feat(x, superpoints, inverse_mapping, batch_offsets)
+                with nvtx.range("decoder"):
+                    with nvtx.range("decoder_forward"):
+                        x = self.decoder(x, x)
+                with nvtx.range("postprocess"):
+                    pred_pts_seg = self.predict_by_feat(x, superpoints)
+        batch_data_samples[0].pred_pts_seg = pred_pts_seg[0]
         return batch_data_samples
+
+    def predict_by_feat(self, out, superpoints):
+        """Predict instance, semantic, and panoptic masks for a single scene.
+
+        NVTX nesting is kept to <=4 levels from the top-level `inference_pass`.
+
+        Args:
+            out (Dict): Decoder output, each value is List of len 1. Keys:
+                `cls_preds`, `sem_preds`, `masks`, `scores`.
+            superpoints (Tensor): of shape (n_raw_points,).
+
+        Returns:
+            List[PointData]: of len 1 with semantic, instance, and panoptic
+            predictions.
+        """
+        cls_preds = out['cls_preds'][0]
+        sem_preds = out['sem_preds'][0]
+        mask_logits = out['masks'][0]
+        obj_scores = out['scores'][0]
+
+        with nvtx.range("panoptic"):
+            with nvtx.range("semantic_full"):
+                sem_full = sem_preds[:, :-1].argmax(dim=1)[superpoints]
+
+            with nvtx.range("semantic_stuff"):
+                stuff_ids = self.test_cfg.stuff_classes
+                sem_stuff = sem_preds[:, stuff_ids].argmax(dim=1)[superpoints]
+
+            with nvtx.range("instance"):
+                scores = F.softmax(cls_preds, dim=-1)[:, :-1]
+                if obj_scores is not None:
+                    scores = scores * obj_scores
+
+                labels = torch.arange(
+                    self.num_classes, device=scores.device).unsqueeze(0).repeat(
+                        len(cls_preds), 1).flatten(0, 1)
+
+                scores, topk_idx = scores.flatten(0, 1).topk(
+                    self.test_cfg.topk_insts, sorted=False)
+                labels = labels[topk_idx]
+                topk_idx = torch.div(
+                    topk_idx, self.num_classes, rounding_mode='floor')
+
+                masks = mask_logits[topk_idx].sigmoid()
+
+                if self.test_cfg.get('obj_normalization', None):
+                    mask_scores = (masks * (mask_logits[topk_idx] > 0)).sum(1) / (
+                        (mask_logits[topk_idx] > 0).sum(1) + 1e-6)
+                    scores = scores * mask_scores
+
+                if self.test_cfg.get('nms', None):
+                    kernel = self.test_cfg.matrix_nms_kernel
+                    scores, labels, masks, _ = mask_matrix_nms(
+                        masks, labels, scores, kernel=kernel)
+
+                masks = masks[:, superpoints]
+                masks = masks > self.test_cfg.sp_score_thr
+
+                # Instance output filtering (inst_score_thr)
+                inst_valid = scores > self.test_cfg.inst_score_thr
+                inst_scores = scores[inst_valid]
+                inst_labels = labels[inst_valid]
+                inst_masks = masks[inst_valid]
+
+                inst_pointnum = inst_masks.sum(1)
+                inst_keep = inst_pointnum > self.test_cfg.npoint_thr
+                inst_scores = inst_scores[inst_keep]
+                inst_labels = inst_labels[inst_keep]
+                inst_masks = inst_masks[inst_keep]
+
+                # Panoptic merge filtering (pan_score_thr)
+                pan_valid = scores > self.test_cfg.pan_score_thr
+                pan_scores = scores[pan_valid]
+                pan_labels = labels[pan_valid]
+                pan_masks = masks[pan_valid]
+
+                pan_pointnum = pan_masks.sum(1)
+                pan_keep = pan_pointnum > self.test_cfg.npoint_thr
+                pan_scores = pan_scores[pan_keep]
+                pan_labels = pan_labels[pan_keep]
+                pan_masks = pan_masks[pan_keep]
+
+            with nvtx.range("panoptic_merge"):
+                if pan_masks.shape[0] == 0:
+                    pan_sem = sem_stuff
+                    pan_inst = sem_stuff
+                else:
+                    pan_scores_sorted, order = pan_scores.sort()
+                    pan_masks_sorted = pan_masks[order]
+                    pan_labels_sorted = pan_labels[order]
+
+                    n_stuff = len(self.test_cfg.stuff_classes)
+                    inst_ids = torch.arange(
+                        n_stuff, n_stuff + pan_masks_sorted.shape[0],
+                        device=pan_masks_sorted.device).view(-1, 1)
+                    insts = inst_ids * pan_masks_sorted
+                    inst_mask, max_idxs = insts.max(axis=0)
+                    sem_mask = pan_labels_sorted[max_idxs] + n_stuff
+
+                    inst_unique, num_pts = inst_mask.unique(return_counts=True)
+                    for inst_id, pts in zip(inst_unique, num_pts):
+                        if pts <= self.test_cfg.npoint_thr and inst_id != 0:
+                            inst_mask[inst_mask == inst_id] = 0
+
+                    sem_mask[inst_mask == 0] = 0
+                    pan_sem = sem_stuff.clone()
+                    pan_sem[inst_mask != 0] = 0
+                    pan_inst = pan_sem.clone()
+                    pan_inst += inst_mask
+                    pan_sem += sem_mask
+
+            with nvtx.range("to_host"):
+                return [
+                    PointData(
+                        pts_semantic_mask=[
+                            sem_full.cpu().numpy(),
+                            pan_sem.cpu().numpy()],
+                        pts_instance_mask=[
+                            inst_masks.cpu().bool().numpy(),
+                            pan_inst.cpu().numpy()],
+                        instance_labels=inst_labels.cpu().numpy(),
+                        instance_scores=inst_scores.cpu().numpy())
+                ]
 
 
 @MODELS.register_module()
@@ -447,6 +620,7 @@ class ScanNet200OneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                  voxel_size,
                  num_classes,
                  query_thr,
+                 query_mult=1.0,
                  backbone=None,
                  neck=None,
                  decoder=None,
@@ -466,6 +640,7 @@ class ScanNet200OneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         self.voxel_size = voxel_size
         self.num_classes = num_classes
         self.query_thr = query_thr
+        self.query_mult = query_mult
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
 
@@ -487,40 +662,51 @@ class ScanNet200OneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                     each of shape (n_points_i, n_classes + 1).
         """
         # construct tensor field
-        coordinates, features = [], []
-        for i in range(len(batch_inputs_dict['points'])):
-            if 'elastic_coords' in batch_inputs_dict:
-                coordinates.append(
-                    batch_inputs_dict['elastic_coords'][i] * self.voxel_size)
-            else:
-                coordinates.append(batch_inputs_dict['points'][i][:, :3])
-            features.append(batch_inputs_dict['points'][i][:, 3:])
-        
-        coordinates, features = ME.utils.batch_sparse_collate(
-            [(c / self.voxel_size, f) for c, f in zip(coordinates, features)],
-            device=coordinates[0].device)
-        field = ME.TensorField(coordinates=coordinates, features=features)
+        with nvtx.range("collate_voxelize"):
+            coordinates, features = [], []
+            for i in range(len(batch_inputs_dict['points'])):
+                if 'elastic_coords' in batch_inputs_dict:
+                    coordinates.append(
+                        batch_inputs_dict['elastic_coords'][i] * self.voxel_size)
+                else:
+                    coordinates.append(batch_inputs_dict['points'][i][:, :3])
+                features.append(batch_inputs_dict['points'][i][:, 3:])
+
+            with nvtx.range("batch_sparse_collate"):
+                coordinates, features = ME.utils.batch_sparse_collate(
+                    [(c / self.voxel_size, f) for c, f in zip(coordinates, features)],
+                    device=coordinates[0].device)
+
+            with nvtx.range("tensorfield_build"):
+                field = ME.TensorField(coordinates=coordinates, features=features)
 
         # forward of backbone and neck
-        x = self.backbone(field.sparse())
+        with nvtx.range("backbone_main"):
+            with nvtx.range("sparse_conv_input"):
+                sparse = field.sparse()
+            x = self.backbone(sparse)
         if self.with_neck:
-            x = self.neck(x)
-        x = x.slice(field).features
+            with nvtx.range("neck"):
+                x = self.neck(x)
+        with nvtx.range("slice_field"):
+            x = x.slice(field).features
 
         # apply scatter_mean
-        sp_pts_masks, n_super_points = [], []
-        for data_sample in batch_data_samples:
-            sp_pts_mask = data_sample.gt_pts_seg.sp_pts_mask
-            sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
-            n_super_points.append(sp_pts_mask.max() + 1)
-        x = scatter_mean(x, torch.cat(sp_pts_masks), dim=0)  # todo: do we need dim?
+        with nvtx.range("scatter_mean_split"):
+            sp_pts_masks, n_super_points = [], []
+            for data_sample in batch_data_samples:
+                sp_pts_mask = data_sample.gt_pts_seg.sp_pts_mask
+                sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
+                n_super_points.append(sp_pts_mask.max() + 1)
+            x = scatter_mean(x, torch.cat(sp_pts_masks), dim=0)  # todo: do we need dim?
 
         # apply cls_layer
-        features = []
-        for i in range(len(n_super_points)):
-            begin = sum(n_super_points[:i])
-            end = sum(n_super_points[:i + 1])
-            features.append(x[begin: end])
+        with nvtx.range("split_per_scene"):
+            features = []
+            for i in range(len(n_super_points)):
+                begin = sum(n_super_points[:i])
+                end = sum(n_super_points[:i + 1])
+                features.append(x[begin: end])
         return features
 
     def _forward(*args, **kwargs):
@@ -567,10 +753,469 @@ class ScanNet200OneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                     (num_points, num_instances) of type bool.
         """
         assert len(batch_data_samples) == 1
-        x = self.extract_feat(batch_inputs_dict, batch_data_samples)
-        x = self.decoder(x, x)
-        pred_pts_seg = self.predict_by_feat(
-            x, batch_data_samples[0].gt_pts_seg.sp_pts_mask)
+        with nvtx.range("inference_pass"):
+            with nvtx.range("extract_feat"):
+                x = self.extract_feat(batch_inputs_dict, batch_data_samples)
+            with nvtx.range("decoder"):
+                with nvtx.range("decoder_forward"):
+                    x = self.decoder(x, x)
+            with nvtx.range("postprocess"):
+                pred_pts_seg = self.predict_by_feat(
+                    x, batch_data_samples[0].gt_pts_seg.sp_pts_mask)
+        batch_data_samples[0].pred_pts_seg = pred_pts_seg[0]
+        return batch_data_samples
+
+    def predict_by_feat(self, out, superpoints):
+        """Predict instance, semantic, and panoptic masks for a single scene.
+
+        NVTX nesting is kept to <=4 levels from the top-level `inference_pass`.
+
+        Args:
+            out (Dict): Decoder output, each value is List of len 1. Keys:
+                `cls_preds`, `sem_preds`, `masks`, `scores`.
+            superpoints (Tensor): of shape (n_raw_points,).
+
+        Returns:
+            List[PointData]: of len 1 with semantic, instance, and panoptic
+            predictions.
+        """
+        cls_preds = out['cls_preds'][0]
+        sem_preds = out['sem_preds'][0]
+        mask_logits = out['masks'][0]
+        obj_scores = out['scores'][0]
+
+        with nvtx.range("panoptic"):
+            # Level 4 ranges start here (inside postprocess->post_forward->panoptic)
+            with nvtx.range("semantic_full"):
+                sem_full = sem_preds[:, :-1].argmax(dim=1)[superpoints]
+
+            with nvtx.range("semantic_stuff"):
+                stuff_ids = self.test_cfg.stuff_classes
+                sem_stuff = sem_preds[:, stuff_ids].argmax(dim=1)[superpoints]
+
+            with nvtx.range("instance"):
+                scores = F.softmax(cls_preds, dim=-1)[:, :-1]
+                if obj_scores is not None:
+                    scores = scores * obj_scores
+
+                labels = torch.arange(
+                    self.num_classes,
+                    device=scores.device).unsqueeze(0).repeat(
+                        len(cls_preds), 1).flatten(0, 1)
+
+                scores, topk_idx = scores.flatten(0, 1).topk(
+                    self.test_cfg.topk_insts, sorted=False)
+                labels = labels[topk_idx]
+                topk_idx = torch.div(
+                    topk_idx, self.num_classes, rounding_mode='floor')
+
+                masks = mask_logits[topk_idx].sigmoid()
+
+                if self.test_cfg.get('obj_normalization', None):
+                    mask_scores = (masks * (mask_logits[topk_idx] > 0)).sum(1) / (
+                        (mask_logits[topk_idx] > 0).sum(1) + 1e-6)
+                    scores = scores * mask_scores
+
+                if self.test_cfg.get('nms', None):
+                    kernel = self.test_cfg.matrix_nms_kernel
+                    scores, labels, masks, _ = mask_matrix_nms(
+                        masks, labels, scores, kernel=kernel)
+
+                masks = masks[:, superpoints]
+                masks = masks > self.test_cfg.sp_score_thr
+
+                valid = scores > self.test_cfg.inst_score_thr
+                scores = scores[valid]
+                labels = labels[valid]
+                masks = masks[valid]
+
+                mask_pointnum = masks.sum(1)
+                keep_pts = mask_pointnum > self.test_cfg.npoint_thr
+                scores_keep = scores[keep_pts]
+                labels_keep = labels[keep_pts]
+                masks_keep = masks[keep_pts]
+
+            with nvtx.range("panoptic_merge"):
+                if masks_keep.shape[0] == 0:
+                    pan_sem = sem_stuff
+                    pan_inst = sem_stuff
+                else:
+                    scores_sorted, order = scores_keep.sort()
+                    masks_sorted = masks_keep[order]
+                    labels_sorted = labels_keep[order]
+
+                    n_stuff = len(self.test_cfg.stuff_classes)
+                    inst_ids = torch.arange(
+                        n_stuff, n_stuff + masks_sorted.shape[0],
+                        device=masks_sorted.device).view(-1, 1)
+                    insts = inst_ids * masks_sorted
+                    inst_mask, max_idxs = insts.max(axis=0)
+                    sem_mask = labels_sorted[max_idxs] + n_stuff
+
+                    inst_unique, num_pts = inst_mask.unique(return_counts=True)
+                    for inst_id, pts in zip(inst_unique, num_pts):
+                        if pts <= self.test_cfg.npoint_thr and inst_id != 0:
+                            inst_mask[inst_mask == inst_id] = 0
+
+                    sem_mask[inst_mask == 0] = 0
+                    pan_sem = sem_stuff.clone()
+                    pan_sem[inst_mask != 0] = 0
+                    pan_inst = pan_sem.clone()
+                    pan_inst += inst_mask
+                    pan_sem += sem_mask
+
+            with nvtx.range("to_host"):
+                return [
+                    PointData(
+                        pts_semantic_mask=[
+                            sem_full.cpu().numpy(),
+                            pan_sem.cpu().numpy()],
+                        pts_instance_mask=[
+                            masks_keep.cpu().bool().numpy(),
+                            pan_inst.cpu().numpy()],
+                instance_labels=labels_keep.cpu().numpy(),
+                instance_scores=scores_keep.cpu().numpy())
+        ]
+
+
+@MODELS.register_module()
+class ScanNet200OneFormer3DSpConv(ScanNetOneFormer3DMixin, Base3DDetector):
+    """SpConv-backed OneFormer3D for ScanNet200 dataset."""
+
+    def __init__(self,
+                 in_channels,
+                 num_channels,
+                 voxel_size,
+                 num_classes,
+                 min_spatial_shape,
+                 query_thr,
+                 query_mult=1.0,
+                 learned_queries_only=False,
+                 backbone=None,
+                 decoder=None,
+                 criterion=None,
+                 train_cfg=None,
+                 test_cfg=None,
+                 data_preprocessor=None,
+                 init_cfg=None):
+        super(Base3DDetector, self).__init__(
+            data_preprocessor=data_preprocessor, init_cfg=init_cfg)
+        self.unet = MODELS.build(backbone)
+        self.decoder = MODELS.build(decoder)
+        self.criterion = MODELS.build(criterion)
+        self.voxel_size = voxel_size
+        self.num_classes = num_classes
+        self.min_spatial_shape = min_spatial_shape
+        self.query_thr = query_thr
+        self.query_mult = query_mult
+        self.learned_queries_only = learned_queries_only
+        self.train_cfg = train_cfg
+        self.test_cfg = test_cfg
+        self._init_layers(in_channels, num_channels)
+        self._full_fp16_infer_initialized = False
+
+    def _maybe_init_full_fp16_infer(self) -> None:
+        """Optionally convert heavy modules to FP16 once for inference.
+
+        Enable by setting ``test_cfg.fp16_infer = True``. Defaults to FP32.
+        """
+        if not (getattr(self, 'test_cfg', None)
+                and self.test_cfg.get('fp16_infer', False)):
+            return
+        if self._full_fp16_infer_initialized:
+            return
+        for module in (self.input_conv, self.unet, self.output_layer, self.decoder):
+            module.half()
+        self._full_fp16_infer_initialized = True
+
+    def _init_layers(self, in_channels, num_channels):
+        self.input_conv = spconv.SparseSequential(
+            spconv.SubMConv3d(
+                in_channels,
+                num_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+                indice_key='subm1'))
+        self.output_layer = spconv.SparseSequential(
+            torch.nn.BatchNorm1d(num_channels, eps=1e-4, momentum=0.1),
+            torch.nn.ReLU(inplace=True))
+
+    def collate(self, points, elastic_points=None):
+        """Collate batch of points to sparse tensor."""
+        if elastic_points is None:
+            coordinates, features = ME.utils.batch_sparse_collate(
+                [((p[:, :3] - p[:, :3].min(0)[0]) / self.voxel_size,
+                  torch.hstack((p[:, 3:], p[:, :3] - p[:, :3].mean(0))))
+                 for p in points])
+        else:
+            coordinates, features = ME.utils.batch_sparse_collate(
+                [((el_p - el_p.min(0)[0]),
+                  torch.hstack((p[:, 3:], p[:, :3] - p[:, :3].mean(0))))
+                 for el_p, p in zip(elastic_points, points)])
+        features = features.float()
+        spatial_shape = torch.clip(
+            coordinates.max(0)[0][1:] + 1, self.min_spatial_shape)
+        field = ME.TensorField(features=features, coordinates=coordinates)
+        tensor = field.sparse()
+        coordinates = tensor.coordinates
+        features = tensor.features
+        inverse_mapping = field.inverse_mapping(tensor.coordinate_map_key)
+        return coordinates, features, inverse_mapping, spatial_shape
+
+    def extract_feat(self, x, superpoints, inverse_mapping, batch_offsets):
+        """Extract features from sparse tensor."""
+        with nvtx.range("input_conv"):
+            x = self.input_conv(x)
+        with nvtx.range("unet"):
+            x, _ = self.unet(x)
+        with nvtx.range("output_proj"):
+            x = self.output_layer(x)
+        with nvtx.range("scatter_mean_split"):
+            x = scatter_mean(x.features[inverse_mapping], superpoints, dim=0)
+        out = []
+        for i in range(len(batch_offsets) - 1):
+            out.append(x[batch_offsets[i]: batch_offsets[i + 1]])
+        return out
+
+    def _forward(*args, **kwargs):
+        """Implement abstract method of Base3DDetector."""
+        pass
+
+    def loss(self, batch_inputs_dict, batch_data_samples, **kwargs):
+        """Calculate losses from a batch of inputs dict and data samples."""
+        batch_offsets = [0]
+        superpoint_bias = 0
+        sp_gt_instances = []
+        sp_pts_masks = []
+        for i in range(len(batch_data_samples)):
+            gt_pts_seg = batch_data_samples[i].gt_pts_seg
+
+            gt_pts_seg.sp_pts_mask += superpoint_bias
+            superpoint_bias = gt_pts_seg.sp_pts_mask.max().item() + 1
+            batch_offsets.append(superpoint_bias)
+
+            sp_gt_instances.append(batch_data_samples[i].gt_instances_3d)
+            sp_pts_masks.append(gt_pts_seg.sp_pts_mask)
+
+        coordinates, features, inverse_mapping, spatial_shape = self.collate(
+            batch_inputs_dict['points'],
+            batch_inputs_dict.get('elastic_coords', None))
+
+        x = spconv.SparseConvTensor(
+            features, coordinates, spatial_shape, len(batch_data_samples))
+        sp_pts_masks = torch.hstack(sp_pts_masks)
+        x = self.extract_feat(
+            x, sp_pts_masks, inverse_mapping, batch_offsets)
+        queries = None
+        if self.learned_queries_only:
+            num_queries = getattr(self.decoder, 'num_queries', 0)
+            if num_queries > 0:
+                for i, inst in enumerate(sp_gt_instances):
+                    sp_masks = inst.get('sp_masks')
+                    labels = inst.get('labels_3d')
+                    if sp_masks is not None:
+                        n_gts = sp_masks.shape[0]
+                        device = sp_masks.device
+                    elif labels is not None:
+                        n_gts = labels.shape[0]
+                        device = labels.device
+                    else:
+                        n_gts = 0
+                        device = x[i].device
+                    inst.query_masks = torch.ones(
+                        (n_gts, num_queries),
+                        dtype=torch.bool,
+                        device=device)
+        else:
+            queries, sp_gt_instances = self._select_queries(x, sp_gt_instances)
+        x = self.decoder(x, queries)
+        loss = self.criterion(x, sp_gt_instances)
+        return loss
+
+    def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):
+        """Predict results from a batch of inputs and data samples."""
+        assert len(batch_data_samples) == 1
+        with nvtx.range("inference_pass"):
+            if not self.training:
+                self._maybe_init_full_fp16_infer()
+            with nvtx.range("collate"):
+                coordinates, features, inverse_mapping, spatial_shape = self.collate(
+                    batch_inputs_dict['points'],
+                    batch_inputs_dict.get('elastic_coords', None))
+                superpoints = batch_data_samples[0].gt_pts_seg.sp_pts_mask
+                superpoints = superpoints.to(features.device)
+                batch_offsets = [0, superpoints.max().item() + 1]
+            with nvtx.range("sparse_tensor_build"):
+                x = spconv.SparseConvTensor(
+                    features, coordinates, spatial_shape, len(batch_data_samples))
+            with nvtx.range("extract_feat"):
+                x = self.extract_feat(x, superpoints, inverse_mapping, batch_offsets)
+            with nvtx.range("decoder"):
+                queries = None if self.learned_queries_only else x
+                x = self.decoder(x, queries)
+            with nvtx.range("postprocess"):
+                if self.learned_queries_only:
+                    pred_pts_seg = self._predict_instance_only(x, superpoints)
+                else:
+                    pred_pts_seg = self.predict_by_feat(
+                        x, batch_data_samples[0].gt_pts_seg.sp_pts_mask)
+        batch_data_samples[0].pred_pts_seg = pred_pts_seg[0]
+        return batch_data_samples
+
+    def _predict_instance_only(self, out, superpoints):
+        """Predict instance masks only, with dummy semantic outputs."""
+        mask_pred, labels, scores = self.predict_by_feat_instance(
+            out, superpoints, self.test_cfg.inst_score_thr)
+        n_points = int(superpoints.shape[0])
+        sem_dummy = superpoints.new_zeros((n_points,), dtype=torch.long)
+        return [
+            PointData(
+                pts_semantic_mask=[
+                    sem_dummy.cpu().numpy(),
+                    sem_dummy.cpu().numpy()],
+                pts_instance_mask=[
+                    mask_pred.cpu().bool().numpy(),
+                    sem_dummy.cpu().numpy()],
+                instance_labels=labels.cpu().numpy(),
+                instance_scores=scores.cpu().numpy())
+        ]
+
+
+@MODELS.register_module()
+class ScanNet200OneFormer3DPTv3(ScanNetOneFormer3DMixin, Base3DDetector):
+    """PTv3-backed OneFormer3D for ScanNet200 dataset."""
+
+    def __init__(self,
+                 in_channels,
+                 voxel_size,
+                 num_classes,
+                 min_spatial_shape,
+                 query_thr,
+                 query_mult=1.0,
+                 backbone=None,
+                 decoder=None,
+                 criterion=None,
+                 train_cfg=None,
+                 test_cfg=None,
+                 data_preprocessor=None,
+                 init_cfg=None):
+        super(Base3DDetector, self).__init__(
+            data_preprocessor=data_preprocessor, init_cfg=init_cfg)
+        self.backbone = MODELS.build(backbone)
+        self.decoder = MODELS.build(decoder)
+        self.criterion = MODELS.build(criterion)
+        self.in_channels = in_channels
+        self.voxel_size = voxel_size
+        self.num_classes = num_classes
+        self.min_spatial_shape = min_spatial_shape
+        self.query_thr = query_thr
+        self.query_mult = query_mult
+        self.train_cfg = train_cfg
+        self.test_cfg = test_cfg
+
+    def collate(self, points, elastic_points=None):
+        """Collate batch of points to PTv3 input dict."""
+        coordinates, features = [], []
+        for i, p in enumerate(points):
+            if elastic_points is None:
+                coords = p[:, :3]
+                coords = (coords - coords.min(0)[0]) / self.voxel_size
+            else:
+                coords = elastic_points[i]
+                coords = coords - coords.min(0)[0]
+            feats = torch.hstack((p[:, 3:], p[:, :3] - p[:, :3].mean(0)))
+            coordinates.append(coords)
+            features.append(feats)
+
+        coordinates, features = ME.utils.batch_sparse_collate(
+            list(zip(coordinates, features)))
+        features = features.float()
+        if self.in_channels is not None:
+            assert features.shape[1] == self.in_channels, (
+                f'Expected in_channels={self.in_channels}, '
+                f'but got features with shape {features.shape}')
+
+        spatial_shape = torch.clip(
+            coordinates.max(0)[0][1:] + 1, self.min_spatial_shape)
+        field = ME.TensorField(features=features, coordinates=coordinates)
+        tensor = field.sparse()
+        coordinates = tensor.coordinates
+        features = tensor.features
+        inverse_mapping = field.inverse_mapping(tensor.coordinate_map_key)
+
+        grid_coord = coordinates[:, 1:].int().contiguous()
+        batch = coordinates[:, 0].long().contiguous()
+        data_dict = dict(
+            feat=features,
+            grid_coord=grid_coord,
+            batch=batch,
+            coord=grid_coord.float(),
+            sparse_shape=spatial_shape.int().tolist())
+        return data_dict, inverse_mapping
+
+    def extract_feat(self, data_dict, superpoints, inverse_mapping, batch_offsets):
+        """Extract features from PTv3 backbone."""
+        with nvtx.range("ptv3_backbone"):
+            point = self.backbone(data_dict)
+        with nvtx.range("scatter_mean_split"):
+            x = scatter_mean(point.feat[inverse_mapping], superpoints, dim=0)
+        out = []
+        for i in range(len(batch_offsets) - 1):
+            out.append(x[batch_offsets[i]: batch_offsets[i + 1]])
+        return out
+
+    def _forward(*args, **kwargs):
+        """Implement abstract method of Base3DDetector."""
+        pass
+
+    def loss(self, batch_inputs_dict, batch_data_samples, **kwargs):
+        """Calculate losses from a batch of inputs and data samples."""
+        batch_offsets = [0]
+        superpoint_bias = 0
+        sp_gt_instances = []
+        sp_pts_masks = []
+        for i in range(len(batch_data_samples)):
+            gt_pts_seg = batch_data_samples[i].gt_pts_seg
+
+            gt_pts_seg.sp_pts_mask += superpoint_bias
+            superpoint_bias = gt_pts_seg.sp_pts_mask.max().item() + 1
+            batch_offsets.append(superpoint_bias)
+
+            sp_gt_instances.append(batch_data_samples[i].gt_instances_3d)
+            sp_pts_masks.append(gt_pts_seg.sp_pts_mask)
+
+        data_dict, inverse_mapping = self.collate(
+            batch_inputs_dict['points'],
+            batch_inputs_dict.get('elastic_coords', None))
+
+        sp_pts_masks = torch.hstack(sp_pts_masks)
+        x = self.extract_feat(
+            data_dict, sp_pts_masks, inverse_mapping, batch_offsets)
+        queries, sp_gt_instances = self._select_queries(x, sp_gt_instances)
+        x = self.decoder(x, queries)
+        loss = self.criterion(x, sp_gt_instances)
+        return loss
+
+    def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):
+        """Predict results from a batch of inputs and data samples."""
+        assert len(batch_data_samples) == 1
+        with nvtx.range("inference_pass"):
+            with nvtx.range("collate"):
+                data_dict, inverse_mapping = self.collate(
+                    batch_inputs_dict['points'],
+                    batch_inputs_dict.get('elastic_coords', None))
+                superpoints = batch_data_samples[0].gt_pts_seg.sp_pts_mask
+                superpoints = superpoints.to(data_dict['feat'].device)
+                batch_offsets = [0, superpoints.max().item() + 1]
+            with nvtx.range("extract_feat"):
+                x = self.extract_feat(
+                    data_dict, superpoints, inverse_mapping, batch_offsets)
+            with nvtx.range("decoder"):
+                x = self.decoder(x, x)
+            with nvtx.range("postprocess"):
+                pred_pts_seg = self.predict_by_feat(
+                    x, batch_data_samples[0].gt_pts_seg.sp_pts_mask)
         batch_data_samples[0].pred_pts_seg = pred_pts_seg[0]
         return batch_data_samples
 

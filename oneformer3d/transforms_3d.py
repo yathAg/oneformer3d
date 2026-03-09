@@ -316,8 +316,10 @@ class PointSample_(PointSample):
         """
 
         point_range = range(len(points))
-        choices = np.random.choice(point_range, 
-                                   min(num_samples, len(points)))
+        choices = np.random.choice(
+            point_range,
+            min(num_samples, len(points)),
+            replace=self.replace)
         
         return points[choices], choices
 

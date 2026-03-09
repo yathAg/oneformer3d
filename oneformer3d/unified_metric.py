@@ -1,7 +1,11 @@
+import os
+import os.path as osp
 import torch
 import numpy as np
+import torch.cuda.nvtx as nvtx
 
 from mmengine.logging import MMLogger
+from mmengine.dist import is_main_process
 
 from mmdet3d.evaluation import InstanceSegMetric
 from mmdet3d.evaluation.metrics import SegMetric
@@ -38,6 +42,8 @@ class UnifiedSegMetric(SegMetric):
                  sem_mapping,   
                  inst_mapping,
                  metric_meta,
+                 dump_scene_preds=False,
+                 dump_dir=None,
                  logger_keys=[('miou',),
                               ('all_ap', 'all_ap_50%', 'all_ap_25%'), 
                               ('pq',)],
@@ -50,6 +56,8 @@ class UnifiedSegMetric(SegMetric):
         self.logger_keys = logger_keys
         self.sem_mapping = np.array(sem_mapping)
         self.inst_mapping = np.array(inst_mapping)
+        self.dump_scene_preds = dump_scene_preds
+        self.dump_dir = dump_dir
         super().__init__(**kwargs)
 
     def compute_metrics(self, results):
@@ -84,7 +92,11 @@ class UnifiedSegMetric(SegMetric):
         gt_masks_pan = []
         pred_masks_pan = []
 
-        for eval_ann, single_pred_results in results:
+        dump_scene_preds = self.dump_scene_preds and is_main_process()
+        if dump_scene_preds and self.dump_dir is not None:
+            os.makedirs(self.dump_dir, exist_ok=True)
+
+        for idx, (eval_ann, single_pred_results) in enumerate(results):
             
             if self.metric_meta['dataset_name'] == 'S3DIS':
                 pan_gt = {}
@@ -133,6 +145,73 @@ class UnifiedSegMetric(SegMetric):
                 torch.tensor(single_pred_results['instance_labels']))
             pred_instance_scores.append(
                 torch.tensor(single_pred_results['instance_scores']))
+
+            if dump_scene_preds and self.dump_dir is not None:
+                with nvtx.range("dump_scene_preds"):
+                    def _maybe_basename(val):
+                        if val is None:
+                            return None
+                        if isinstance(val, (list, tuple)) and len(val) == 1:
+                            val = val[0]
+                        val = str(val)
+                        # strip extension if it looks like a path/filename
+                        if '/' in val or '\\' in val or '.' in val:
+                            val = osp.splitext(osp.basename(val))[0]
+                        return val
+
+                    candidates = []
+                    if isinstance(eval_ann, dict):
+                        metainfo = eval_ann.get('metainfo', {}) if isinstance(eval_ann.get('metainfo', {}), dict) else {}
+                        for key in ['scene_id', 'scan_id', 'lidar_path', 'pts_path', 'filename', 'sample_idx']:
+                            cand = _maybe_basename(eval_ann.get(key))
+                            if cand:
+                                candidates.append(cand)
+                        meta_cand = _maybe_basename(metainfo.get('scene_id') or metainfo.get('sample_idx'))
+                        if meta_cand:
+                            candidates.append(meta_cand)
+                        lidar_info = eval_ann.get('lidar_points') or {}
+                        if isinstance(lidar_info, dict):
+                            lp_cand = _maybe_basename(lidar_info.get('lidar_path') or lidar_info.get('pts_path'))
+                            if lp_cand:
+                                candidates.append(lp_cand)
+                        sem_path = _maybe_basename(eval_ann.get('pts_semantic_mask_path'))
+                        if sem_path:
+                            candidates.append(sem_path)
+
+                    scene_id = next((c for c in candidates if not str(c).isdigit()), None)
+                    if scene_id is None and candidates:
+                        scene_id = candidates[0]
+                    if scene_id is None:
+                        scene_id = str(idx)
+                    scene_id = str(scene_id)
+                    # Build id_offset-encoded panoptic ids:
+                    #  - stuff points keep their semantic class id
+                    #  - thing points store (id_offset + instance_id)
+                    pan_sem = np.asarray(single_pred_results['pts_semantic_mask'][1])
+                    pan_inst = np.asarray(single_pred_results['pts_instance_mask'][1])
+                    stuff_mask = np.isin(pan_sem, self.stuff_class_inds)
+                    panoptic_pred = pan_sem.copy()
+                    panoptic_pred[~stuff_mask] = self.id_offset + pan_inst[~stuff_mask]
+
+                    # Persist everything needed for post-hoc instance AP:
+                    #  - instance_masks: boolean [n_inst, n_points]
+                    #  - instance_labels / instance_scores
+                    #  - panoptic_pred / panoptic_semantic for visualization
+                    instance_masks = np.asarray(
+                        single_pred_results['pts_instance_mask'][0]
+                    ).astype(np.uint8)  # uint8 saves space vs bool
+
+                    save_obj = {
+                        'scene_id': scene_id,
+                        'panoptic_pred': panoptic_pred.astype(np.int64),
+                        'panoptic_semantic': pan_sem.astype(np.int64),
+                        'instance_masks': instance_masks,
+                        'instance_labels': single_pred_results['instance_labels'],
+                        'instance_scores': single_pred_results['instance_scores'],
+                    }
+                    save_path = osp.join(self.dump_dir, f'{scene_id}.pth')
+                    torch.save(save_obj, save_path)
+                    print(f"[dump_scene_preds] saved {save_path}")
 
         ret_pan = panoptic_seg_eval(
             gt_masks_pan, pred_masks_pan, classes, thing_classes,

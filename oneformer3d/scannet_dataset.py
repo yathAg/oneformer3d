@@ -29,6 +29,21 @@ class ScanNetSegDataset_(ScanNetSegDataset):
 
         info = super().parse_data_info(info)
 
+        # Ensure eval_ann_info carries identifiers for dumping
+        eval_ann = info.get('eval_ann_info', {}) if isinstance(
+            info.get('eval_ann_info', {}), dict) else {}
+        eval_ann.setdefault('scene_id', info.get('scene_id'))
+        eval_ann.setdefault('scan_id', info.get('scan_id'))
+        eval_ann.setdefault('sample_idx', info.get('sample_idx'))
+        eval_ann.setdefault('lidar_path', info.get('lidar_path'))
+        eval_ann.setdefault('pts_path', info.get('pts_path'))
+        eval_ann.setdefault('filename', info.get('filename'))
+        eval_ann.setdefault('metainfo', info.get('metainfo'))
+        eval_ann.setdefault('lidar_points', info.get('lidar_points'))
+        eval_ann.setdefault('pts_semantic_mask_path',
+                            info.get('pts_semantic_mask_path'))
+        info['eval_ann_info'] = eval_ann
+
         return info
 
 
@@ -100,3 +115,87 @@ class ScanNet200SegDataset_(ScanNetSegDataset_):
         1189, 1190, 1191),
     'seg_all_class_ids': tuple(range(1, 1358)),
     'palette': [random.sample(range(0, 255), 3) for i in range(200)]}
+
+
+@DATASETS.register_module()
+class ScanNetPPSegDataset_(ScanNetSegDataset_):
+    METAINFO = {
+        'classes': (
+            'wall', 'ceiling', 'floor', 'table', 'door', 'ceiling lamp',
+            'cabinet', 'blinds', 'curtain', 'chair', 'storage cabinet',
+            'office chair', 'bookshelf', 'whiteboard', 'window', 'box',
+            'window frame', 'monitor', 'shelf', 'doorframe', 'pipe', 'heater',
+            'kitchen cabinet', 'sofa', 'windowsill', 'bed', 'shower wall',
+            'trash can', 'book', 'plant', 'blanket', 'tv', 'computer tower',
+            'kitchen counter', 'refrigerator', 'jacket', 'electrical duct',
+            'sink', 'bag', 'picture', 'pillow', 'towel', 'suitcase',
+            'backpack', 'crate', 'keyboard', 'rack', 'toilet', 'paper',
+            'printer', 'poster', 'painting', 'microwave', 'board', 'shoes',
+            'socket', 'bottle', 'bucket', 'cushion', 'basket', 'shoe rack',
+            'telephone', 'file folder', 'cloth', 'blind rail', 'laptop',
+            'plant pot', 'exhaust fan', 'cup', 'coat hanger', 'light switch',
+            'speaker', 'table lamp', 'air vent', 'clothes hanger', 'kettle',
+            'smoke detector', 'container', 'power strip', 'slippers',
+            'paper bag', 'mouse', 'cutting board', 'toilet paper',
+            'paper towel', 'pot', 'clock', 'pan', 'tap', 'jar',
+            'soap dispenser', 'binder', 'bowl', 'tissue box',
+            'whiteboard eraser', 'toilet brush', 'spray bottle', 'headphones',
+            'stapler', 'marker'),
+        'seg_valid_class_ids': tuple(range(1, 101)),
+        'seg_all_class_ids': tuple(range(1, 101)),
+        'palette': [random.sample(range(0, 255), 3) for i in range(100)]
+    }
+
+
+@DATASETS.register_module()
+class ScanNetPPSegDatasetExt_(ScanNetSegDataset_):
+    METAINFO = {
+        'classes': (
+            'wall', 'ceiling', 'floor', 'shower wall', 'bathroom wall',
+            'tiled wall', 'object', 'box', 'chair', 'ceiling lamp', 'book',
+            'socket', 'table', 'window', 'door', 'bottle', 'light switch',
+            'pipe', 'cabinet', 'monitor', 'shelf', 'paper', 'heater',
+            'office chair', 'pillow', 'doorframe', 'window frame', 'shoes',
+            'trash can', 'picture', 'cup', 'plant', 'keyboard', 'bag',
+            'windowsill', 'clothes', 'curtain', 'mouse', 'jacket',
+            'door frame', 'towel', 'smoke detector', 'objects',
+            'kitchen cabinet', 'power sockets', 'backpack', 'plant pot',
+            'blanket', 'whiteboard', 'blinds', 'poster', 'sink',
+            'computer tower', 'electrical duct', 'decoration', 'bed',
+            'cable raceway', 'structure', 'wall lamp', 'laptop',
+            'storage cabinet', 'power strip', 'suitcase', 'bookshelf',
+            'telephone', 'jar', 'cloth', 'sofa', 'basket', 'wardrobe',
+            'speaker', 'crate', 'toilet paper', 'stool', 'cable duct',
+            'faucet', 'table lamp', 'switch', 'bowl', 'kitchen counter',
+            'cable', 'extension cord', 'slippers', 'bucket',
+            'electrical control panel', 'binder', 'light switches',
+            'power outlet', 'painting', 'mattress', 'rug', 'plate',
+            'toilet', 'notebook', 'microwave', 'shelf rail', 'board', 'tv',
+            'whiteboard eraser', 'refrigerator', 'coax outlet', 'file folder',
+            'router', 'cushion', 'cutting board', 'bedside table', 'lamp',
+            'phone charger', 'kettle', 'paper bag', 'paper towel', 'carpet',
+            'headphones', 'soap dispenser', 'machine', 'pot', 'vase',
+            'trolley', 'tap', 'umbrella', 'tray', 'curtain rod',
+            'kitchen towel', 'sponge', 'oven', 'mirror', 'container',
+            'folder', 'pedestal fan', 'lab equipment', 'spray bottle',
+            'storage rack', 'tube', 'curtain rail',
+            'paper towel dispenser', 'laundry basket', 'luggage', 'pillar',
+            'bottle crate', 'counter', 'intercom', 'standing lamp',
+            'photograph', 'toilet brush', 'exhaust fan', 'heat pipe',
+            'note', 'printer', 'electric kettle', 'vent', 'floor lamp',
+            'coffee maker', 'opaque window panel', 'coat', 'file binder',
+            'frying pan', 'shirt', 'pc', 'light', 'mop', 'roller blinds',
+            'air vent', 'ceiling panel', 'tissue box', 'desk lamp',
+            'shampoo bottle', 'bottles', 'clock', 'power outlets', 'broom',
+            'pen holder', 'projector', 'stove', 'ball', 'stove top',
+            'thermos', 'whiteboard marker', 'yoga mat', 'cooking pot',
+            'vacuum cleaner', 'fire extinguisher', 'plastic bag',
+            'toilet flush button', 'magazine', 'panel', 'toilet paper roll',
+            'valve', 'blackboard', 'desk divider', 'candle', 'coffee table',
+            'dumbbell', 'laptop charger', 'coat hanger', 'picture frame',
+            'dustbin', 'knife', 'pan', 'power adapter',
+            'reusable shopping bag'),
+        'seg_valid_class_ids': tuple(range(1, 201)),
+        'seg_all_class_ids': tuple(range(1, 201)),
+        'palette': [random.sample(range(0, 255), 3) for i in range(200)]
+    }

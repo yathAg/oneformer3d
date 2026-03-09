@@ -23,3 +23,21 @@ class InstanceData_(InstanceData):
                               Sized), 'value must contain `__len__` attribute'
 
             super(InstanceData, self).__setattr__(name, value)
+
+
+class ChunkedMask:
+    """Lazy mask logits computed from query and mask features."""
+
+    def __init__(self, queries, mask_feats):
+        self.queries = queries
+        self.mask_feats = mask_feats
+        self.shape = (queries.shape[0], mask_feats.shape[0])
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, idx):
+        q = self.queries[idx]
+        if q.dim() == 1:
+            q = q.unsqueeze(0)
+        return q @ self.mask_feats.T

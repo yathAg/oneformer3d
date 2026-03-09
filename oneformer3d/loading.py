@@ -1,6 +1,7 @@
 # Adapted from mmdet3d/datasets/transforms/loading.py
 import mmengine
 import numpy as np
+import torch.cuda.nvtx as nvtx
 
 from mmdet3d.datasets.transforms import LoadAnnotations3D
 from mmdet3d.datasets.transforms.loading import get
@@ -31,16 +32,17 @@ class LoadAnnotations3D_(LoadAnnotations3D):
         """
         sp_pts_mask_path = results['super_pts_path']
 
-        try:
-            mask_bytes = get(
-                sp_pts_mask_path, backend_args=self.backend_args)
-            # add .copy() to fix read-only bug
-            sp_pts_mask = np.frombuffer(
-                mask_bytes, dtype=np.int64).copy()
-        except ConnectionError:
-            mmengine.check_file_exist(sp_pts_mask_path)
-            sp_pts_mask = np.fromfile(
-                sp_pts_mask_path, dtype=np.int64)
+        with nvtx.range("load_superpoints"):
+            try:
+                mask_bytes = get(
+                    sp_pts_mask_path, backend_args=self.backend_args)
+                # add .copy() to fix read-only bug
+                sp_pts_mask = np.frombuffer(
+                    mask_bytes, dtype=np.int64).copy()
+            except ConnectionError:
+                mmengine.check_file_exist(sp_pts_mask_path)
+                sp_pts_mask = np.fromfile(
+                    sp_pts_mask_path, dtype=np.int64)
 
         results['sp_pts_mask'] = sp_pts_mask
 
@@ -92,15 +94,16 @@ class NormalizePointsColor_(NormalizePointsColor):
             Updated key and value are described below.
                 - points (:obj:`BasePoints`): Points after color normalization.
         """
-        points = input_dict['points']
-        assert points.attribute_dims is not None and \
-               'color' in points.attribute_dims.keys(), \
-               'Expect points have color attribute'
-        if self.color_mean is not None:
-            points.color = points.color - \
-                           points.color.new_tensor(self.color_mean)
-        if self.color_std is not None:
-            points.color = points.color / \
-                points.color.new_tensor(self.color_std)
-        input_dict['points'] = points
+        with nvtx.range("normalize_color"):
+            points = input_dict['points']
+            assert points.attribute_dims is not None and \
+                   'color' in points.attribute_dims.keys(), \
+                   'Expect points have color attribute'
+            if self.color_mean is not None:
+                points.color = points.color - \
+                               points.color.new_tensor(self.color_mean)
+            if self.color_std is not None:
+                points.color = points.color / \
+                    points.color.new_tensor(self.color_std)
+            input_dict['points'] = points
         return input_dict

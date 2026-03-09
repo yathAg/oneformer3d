@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
-from .structures import InstanceData_
+from .structures import InstanceData_, ChunkedMask
 from mmdet3d.registry import MODELS, TASK_UTILS
 
 
@@ -24,6 +24,114 @@ def batch_sigmoid_bce_loss(inputs, targets):
     pos_loss = torch.einsum('nc,mc->nm', pos, targets)
     neg_loss = torch.einsum('nc,mc->nm', neg, (1 - targets))
     return (pos_loss + neg_loss) / inputs.shape[1]
+
+
+def batch_sigmoid_bce_loss_chunked(inputs, targets, chunk_size=65536):
+    """Sigmoid BCE loss in chunks to reduce peak memory.
+
+    Args:
+        inputs: of shape (n_queries, n_points).
+        targets: of shape (n_gts, n_points).
+        chunk_size (int): points per chunk.
+
+    Returns:
+        Tensor: Loss of shape (n_queries, n_gts).
+    """
+    n_queries, n_points = inputs.shape
+    n_gts = targets.shape[0]
+    pos_loss = inputs.new_zeros((n_queries, n_gts))
+    neg_loss = inputs.new_zeros((n_queries, n_gts))
+    for start in range(0, n_points, chunk_size):
+        end = min(start + chunk_size, n_points)
+        inputs_chunk = inputs[:, start:end]
+        targets_chunk = targets[:, start:end].float()
+        # softplus(-x) == BCEWithLogits(x, 1), softplus(x) == BCEWithLogits(x, 0)
+        pos = F.softplus(-inputs_chunk)
+        neg = F.softplus(inputs_chunk)
+        pos_loss = pos_loss + pos @ targets_chunk.T
+        neg_loss = neg_loss + neg @ (1 - targets_chunk).T
+    return (pos_loss + neg_loss) / n_points
+
+
+def batch_sigmoid_bce_loss_factor(queries,
+                                  mask_feats,
+                                  targets,
+                                  query_chunk_size=256,
+                                  point_chunk_size=32768):
+    """Sigmoid BCE loss from factorized masks, computed in chunks.
+
+    Args:
+        queries: of shape (n_queries, d_model).
+        mask_feats: of shape (n_points, d_model).
+        targets: of shape (n_gts, n_points).
+        query_chunk_size (int): queries per chunk.
+        point_chunk_size (int): points per chunk.
+
+    Returns:
+        Tensor: Loss of shape (n_queries, n_gts).
+    """
+    n_queries = queries.shape[0]
+    n_gts = targets.shape[0]
+    n_points = targets.shape[1]
+    pos_loss = queries.new_zeros((n_queries, n_gts))
+    neg_loss = queries.new_zeros((n_queries, n_gts))
+    for q_start in range(0, n_queries, query_chunk_size):
+        q_end = min(q_start + query_chunk_size, n_queries)
+        q_chunk = queries[q_start:q_end]
+        pos_loss_q = queries.new_zeros((q_chunk.shape[0], n_gts))
+        neg_loss_q = queries.new_zeros((q_chunk.shape[0], n_gts))
+        for p_start in range(0, n_points, point_chunk_size):
+            p_end = min(p_start + point_chunk_size, n_points)
+            mask_feats_chunk = mask_feats[p_start:p_end]
+            inputs_chunk = q_chunk @ mask_feats_chunk.T
+            targets_chunk = targets[:, p_start:p_end].float()
+            pos = F.softplus(-inputs_chunk)
+            neg = F.softplus(inputs_chunk)
+            pos_loss_q = pos_loss_q + pos @ targets_chunk.T
+            neg_loss_q = neg_loss_q + neg @ (1 - targets_chunk).T
+        pos_loss[q_start:q_end] = pos_loss_q
+        neg_loss[q_start:q_end] = neg_loss_q
+    return (pos_loss + neg_loss) / n_points
+
+
+def batch_dice_loss_factor(queries,
+                           mask_feats,
+                           targets,
+                           query_chunk_size=256,
+                           point_chunk_size=32768):
+    """Dice loss from factorized masks, computed in chunks.
+
+    Args:
+        queries: of shape (n_queries, d_model).
+        mask_feats: of shape (n_points, d_model).
+        targets: of shape (n_gts, n_points).
+        query_chunk_size (int): queries per chunk.
+        point_chunk_size (int): points per chunk.
+
+    Returns:
+        Tensor: Loss of shape (n_queries, n_gts).
+    """
+    n_queries = queries.shape[0]
+    n_gts = targets.shape[0]
+    n_points = targets.shape[1]
+    sum_targets = targets.float().sum(-1)
+    loss = queries.new_zeros((n_queries, n_gts))
+    for q_start in range(0, n_queries, query_chunk_size):
+        q_end = min(q_start + query_chunk_size, n_queries)
+        q_chunk = queries[q_start:q_end]
+        numerator = queries.new_zeros((q_chunk.shape[0], n_gts))
+        sum_inputs = queries.new_zeros((q_chunk.shape[0],))
+        for p_start in range(0, n_points, point_chunk_size):
+            p_end = min(p_start + point_chunk_size, n_points)
+            mask_feats_chunk = mask_feats[p_start:p_end]
+            inputs_chunk = q_chunk @ mask_feats_chunk.T
+            inputs_chunk = inputs_chunk.sigmoid()
+            targets_chunk = targets[:, p_start:p_end].float()
+            numerator = numerator + inputs_chunk @ targets_chunk.T
+            sum_inputs = sum_inputs + inputs_chunk.sum(-1)
+        denominator = sum_inputs[:, None] + sum_targets[None, :]
+        loss[q_start:q_end] = 1 - (2 * numerator + 1) / (denominator + 1)
+    return loss
 
 
 def batch_dice_loss(inputs, targets):
@@ -387,6 +495,45 @@ class MaskBCECost:
 
 
 @TASK_UTILS.register_module()
+class MaskBCECostChunked:
+    """Chunked sigmoid BCE cost for masks to reduce peak memory.
+
+    Args:
+        weight (float): Weight of the cost.
+        chunk_size (int): points per chunk.
+    """
+    def __init__(self, weight, chunk_size=65536,
+                 query_chunk_size=256, point_chunk_size=32768):
+        self.weight = weight
+        self.chunk_size = chunk_size
+        self.query_chunk_size = query_chunk_size
+        self.point_chunk_size = point_chunk_size
+
+    def __call__(self, pred_instances, gt_instances, **kwargs):
+        """Compute match cost.
+
+        Args:
+            pred_instances (:obj:`InstanceData_`): Predicted instances which
+                must contain `masks` of shape (n_queries, n_points).
+            gt_instances (:obj:`InstanceData_`): Ground truth which must contain
+                `masks` of shape (n_gts, n_points).
+        
+        Returns:
+            Tensor: Cost of shape (n_queries, n_gts).
+        """
+        masks = pred_instances.masks
+        if isinstance(masks, ChunkedMask):
+            cost = batch_sigmoid_bce_loss_factor(
+                masks.queries, masks.mask_feats, gt_instances.masks,
+                query_chunk_size=self.query_chunk_size,
+                point_chunk_size=self.point_chunk_size)
+        else:
+            cost = batch_sigmoid_bce_loss_chunked(
+                masks, gt_instances.masks, self.chunk_size)
+        return cost * self.weight
+
+
+@TASK_UTILS.register_module()
 class MaskDiceCost:
     """Dice cost for masks.
 
@@ -410,6 +557,45 @@ class MaskDiceCost:
         """
         cost = batch_dice_loss(
             pred_instances.masks, gt_instances.masks.float())
+        return cost * self.weight
+
+
+@TASK_UTILS.register_module()
+class MaskDiceCostChunked:
+    """Chunked dice cost for masks to reduce peak memory.
+
+    Args:
+        weight (float): Weight of the cost.
+        query_chunk_size (int): queries per chunk.
+        point_chunk_size (int): points per chunk.
+    """
+    def __init__(self, weight, query_chunk_size=256, point_chunk_size=32768):
+        self.weight = weight
+        self.query_chunk_size = query_chunk_size
+        self.point_chunk_size = point_chunk_size
+
+    def __call__(self, pred_instances, gt_instances, **kwargs):
+        """Compute match cost.
+
+        Args:
+            pred_instances (:obj:`InstanceData_`): Predicted instances which
+                must contain `masks` of shape (n_queries, n_points) or
+                a ChunkedMask.
+            gt_instances (:obj:`InstanceData_`): Ground truth which must contain
+                `masks` of shape (n_gts, n_points).
+        
+        Returns:
+            Tensor: Cost of shape (n_queries, n_gts).
+        """
+        masks = pred_instances.masks
+        if isinstance(masks, ChunkedMask):
+            cost = batch_dice_loss_factor(
+                masks.queries, masks.mask_feats, gt_instances.masks,
+                query_chunk_size=self.query_chunk_size,
+                point_chunk_size=self.point_chunk_size)
+        else:
+            cost = batch_dice_loss(
+                masks, gt_instances.masks.float())
         return cost * self.weight
 
 

@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from mmengine.model import BaseModule
 from mmdet3d.registry import MODELS
+from .structures import ChunkedMask
 
 
 class CrossAttentionLayer(BaseModule):
@@ -89,6 +90,109 @@ class SelfAttentionLayer(BaseModule):
         out = []
         for y in x:
             z, _ = self.attn(y, y, y)
+            z = self.dropout(z) + y
+            z = self.norm(z)
+            out.append(z)
+        return out
+
+
+class CrossAttentionLayerSDPA(BaseModule):
+    """Cross attention layer with SDPA/flash-friendly call."""
+
+    def __init__(self, d_model, num_heads, dropout, fix=False,
+                 query_chunk_size=None):
+        super().__init__()
+        self.fix = fix
+        self.query_chunk_size = query_chunk_size
+        self.attn = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        # todo: why BaseModule doesn't call it without us?
+        self.init_weights()
+
+    def init_weights(self):
+        """Init weights."""
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, sources, queries, attn_masks=None):
+        """Forward pass.
+
+        Args:
+            sources (List[Tensor]): of len batch_size,
+                each of shape (n_points_i, d_model).
+            queries (List[Tensor]): of len batch_size,
+                each of shape(n_queries_i, d_model).
+            attn_masks (List[Tensor] or None): of len batch_size,
+                each of shape (n_queries, n_points).
+        
+        Return:
+            List[Tensor]: Queries of len batch_size,
+                each of shape(n_queries_i, d_model).
+        """
+        outputs = []
+        for i in range(len(sources)):
+            k = v = sources[i]
+            attn_mask = attn_masks[i] if attn_masks is not None else None
+            if self.query_chunk_size is None:
+                output, _ = self.attn(
+                    queries[i], k, v, attn_mask=attn_mask, need_weights=False)
+            else:
+                q = queries[i]
+                q_chunks = []
+                for start in range(0, q.shape[0], self.query_chunk_size):
+                    end = min(start + self.query_chunk_size, q.shape[0])
+                    q_chunk = q[start:end]
+                    attn_mask_chunk = None if attn_mask is None else attn_mask[start:end]
+                    out_chunk, _ = self.attn(
+                        q_chunk, k, v, attn_mask=attn_mask_chunk, need_weights=False)
+                    q_chunks.append(out_chunk)
+                output = torch.cat(q_chunks, dim=0)
+            if self.fix:
+                output = self.dropout(output)
+            output = output + queries[i]
+            if self.fix:
+                output = self.norm(output)
+            outputs.append(output)
+        return outputs
+
+
+class SelfAttentionLayerSDPA(BaseModule):
+    """Self attention layer with SDPA/flash-friendly call."""
+
+    def __init__(self, d_model, num_heads, dropout, query_chunk_size=None):
+        super().__init__()
+        self.query_chunk_size = query_chunk_size
+        self.attn = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        """Forward pass.
+
+        Args:
+            x (List[Tensor]): Queries of len batch_size,
+                each of shape(n_queries_i, d_model).
+        
+        Returns:
+            List[Tensor]: Queries of len batch_size,
+                each of shape(n_queries_i, d_model).
+        """
+        out = []
+        for y in x:
+            if self.query_chunk_size is None:
+                z, _ = self.attn(y, y, y, need_weights=False)
+            else:
+                z_chunks = []
+                for start in range(0, y.shape[0], self.query_chunk_size):
+                    end = min(start + self.query_chunk_size, y.shape[0])
+                    y_chunk = y[start:end]
+                    z_chunk, _ = self.attn(y_chunk, y, y, need_weights=False)
+                    z_chunks.append(z_chunk)
+                z = torch.cat(z_chunks, dim=0)
             z = self.dropout(z) + y
             z = self.norm(z)
             out.append(z)
@@ -343,6 +447,45 @@ class QueryDecoder(BaseModule):
 
 
 @MODELS.register_module()
+class QueryDecoderSDPA(QueryDecoder):
+    """Query decoder with SDPA/flash-friendly attention calls."""
+
+    def __init__(self, num_layers, num_instance_queries, num_semantic_queries,
+                 num_classes, in_channels, d_model, num_heads, hidden_dim,
+                 dropout, activation_fn, iter_pred, attn_mask, fix_attention,
+                 objectness_flag, attn_query_chunk_size=None, **kwargs):
+        super().__init__(
+            num_layers=num_layers,
+            num_instance_queries=num_instance_queries,
+            num_semantic_queries=num_semantic_queries,
+            num_classes=num_classes,
+            in_channels=in_channels,
+            d_model=d_model,
+            num_heads=num_heads,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            activation_fn=activation_fn,
+            iter_pred=iter_pred,
+            attn_mask=attn_mask,
+            fix_attention=fix_attention,
+            objectness_flag=objectness_flag,
+            **kwargs)
+        # Replace attention layers with SDPA-friendly variants.
+        self.cross_attn_layers = nn.ModuleList([
+            CrossAttentionLayerSDPA(
+                d_model, num_heads, dropout, fix_attention,
+                query_chunk_size=attn_query_chunk_size)
+            for _ in range(num_layers)
+        ])
+        self.self_attn_layers = nn.ModuleList([
+            SelfAttentionLayerSDPA(
+                d_model, num_heads, dropout,
+                query_chunk_size=attn_query_chunk_size)
+            for _ in range(num_layers)
+        ])
+
+
+@MODELS.register_module()
 class ScanNetQueryDecoder(QueryDecoder):
     """We simply add semantic prediction for each instance query.
     """
@@ -480,6 +623,117 @@ class ScanNetQueryDecoder(QueryDecoder):
             masks=pred_masks[-1],
             scores=pred_scores[-1],
             aux_outputs=aux_outputs)
+
+
+@MODELS.register_module()
+class ScanNetQueryDecoderSDPA(ScanNetQueryDecoder):
+    """ScanNet query decoder with SDPA/flash-friendly attention calls."""
+
+    def __init__(self, num_instance_classes, num_semantic_classes,
+                 d_model, num_semantic_linears, **kwargs):
+        attn_query_chunk_size = kwargs.pop('attn_query_chunk_size', None)
+        self.mask_query_chunk_size = kwargs.pop('mask_query_chunk_size', None)
+        super().__init__(
+            num_instance_classes=num_instance_classes,
+            num_semantic_classes=num_semantic_classes,
+            d_model=d_model,
+            num_semantic_linears=num_semantic_linears,
+            **kwargs)
+        # Replace attention layers with SDPA-friendly variants.
+        if len(self.cross_attn_layers) > 0:
+            base_cross = self.cross_attn_layers[0]
+            d_model = kwargs.get('d_model', base_cross.attn.embed_dim)
+            num_heads = kwargs.get('num_heads', base_cross.attn.num_heads)
+            dropout = kwargs.get('dropout', base_cross.attn.dropout)
+            fix_attention = kwargs.get('fix_attention', base_cross.fix)
+            num_layers = kwargs.get('num_layers', len(self.cross_attn_layers))
+            self.cross_attn_layers = nn.ModuleList([
+                CrossAttentionLayerSDPA(
+                    d_model, num_heads, dropout, fix_attention,
+                    query_chunk_size=attn_query_chunk_size)
+                for _ in range(num_layers)
+            ])
+            self.self_attn_layers = nn.ModuleList([
+                SelfAttentionLayerSDPA(
+                    d_model, num_heads, dropout,
+                    query_chunk_size=attn_query_chunk_size)
+                for _ in range(num_layers)
+            ])
+        assert num_semantic_linears in [1, 2]
+        if num_semantic_linears == 2:
+            self.out_sem = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.ReLU(),
+                nn.Linear(d_model, num_semantic_classes + 1))
+        else:
+            self.out_sem = nn.Linear(d_model, num_semantic_classes + 1)
+
+    def _forward_head(self, queries, mask_feats, last_flag):
+        """Prediction head forward (SDPA variant, memory-friendly mask check).
+
+        Args:
+            queries (List[Tensor] | Tensor): List of len batch_size,
+                each of shape (n_queries_i, d_model). Or tensor of
+                shape (batch_size, n_queries, d_model).
+            mask_feats (List[Tensor]): of len batch_size,
+                each of shape (n_points_i, d_model).
+
+        Returns:
+            Tuple:
+                List[Tensor]: Classification predictions of len batch_size,
+                    each of shape (n_queries_i, n_instance_classes + 1).
+                List[Tensor] or None: Semantic predictions of len batch_size,
+                    each of shape (n_queries_i, n_semantic_classes + 1).
+                List[Tensor]: Confidence scores of len batch_size,
+                    each of shape (n_queries_i, 1).
+                List[Tensor]: Predicted masks of len batch_size,
+                    each of shape (n_queries_i, n_points_i).
+                List[Tensor] or None: Attention masks of len batch_size,
+                    each of shape (n_queries_i, n_points_i).
+        """
+        cls_preds, sem_preds, pred_scores, pred_masks, attn_masks = \
+            [], [], [], [], []
+        use_chunked_mask = self.training and self.mask_query_chunk_size
+        for i in range(len(queries)):
+            norm_query = self.out_norm(queries[i])
+            cls_preds.append(self.out_cls(norm_query))
+            if last_flag:
+                sem_preds.append(self.out_sem(norm_query))
+            pred_score = self.out_score(norm_query) if self.objectness_flag \
+                else None
+            pred_scores.append(pred_score)
+
+            if use_chunked_mask:
+                pred_masks.append(ChunkedMask(norm_query, mask_feats[i]))
+            else:
+                pred_mask = torch.einsum('nd,md->nm', norm_query, mask_feats[i])
+                pred_masks.append(pred_mask)
+
+            if self.attn_mask:
+                if use_chunked_mask:
+                    attn_chunks = []
+                    for start in range(0, norm_query.shape[0],
+                                       self.mask_query_chunk_size):
+                        end = min(start + self.mask_query_chunk_size,
+                                  norm_query.shape[0])
+                        q_chunk = norm_query[start:end]
+                        pred_mask_chunk = torch.einsum(
+                            'nd,md->nm', q_chunk, mask_feats[i])
+                        attn_mask_chunk = (pred_mask_chunk.sigmoid() < 0.5).bool()
+                        # Use all() to avoid an int64 cast of the full mask.
+                        attn_mask_chunk[torch.where(
+                            attn_mask_chunk.all(dim=-1))] = False
+                        attn_chunks.append(attn_mask_chunk)
+                    attn_mask = torch.cat(attn_chunks, dim=0).detach()
+                else:
+                    pred_mask = pred_masks[-1]
+                    attn_mask = (pred_mask.sigmoid() < 0.5).bool()
+                    # Use all() to avoid an int64 cast of the full mask.
+                    attn_mask[torch.where(attn_mask.all(dim=-1))] = False
+                    attn_mask = attn_mask.detach()
+                attn_masks.append(attn_mask)
+        attn_masks = attn_masks if self.attn_mask else None
+        sem_preds = sem_preds if last_flag else None
+        return cls_preds, sem_preds, pred_scores, pred_masks, attn_masks
 
 
 @MODELS.register_module()
